@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "bumc_instascraping"
+version = "0.1.0"
+description = ""
+authors = ["David Assefa Tofu <davidtofu2018@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+insta-scrape = "^2.1.2"
+
+[tool.poetry.dev-dependencies]
+black = "^21.6b0"
+mypy = "^0.902"
+pynvim = "^0.4.3"
+ptpython = "^3.0.17"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
