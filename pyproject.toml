@@ -12,13 +12,21 @@ typer = "^0.3.2"
 aiohttp = "^3.7.4"
 dill = "^0.3.4"
 CacheControl = "^0.12.6"
+pydantic = "^1.8.2"
+typing-json = "^0.1.3"
+requests = {extras = ["socks"], version = "^2.26.0"}
 
 [tool.poetry.dev-dependencies]
 black = "^21.6b0"
 mypy = "^0.902"
 pynvim = "^0.4.3"
 ptpython = "^3.0.17"
+pudb = "^2021.1"
+ipdb = "^0.13.9"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pyright]
+reportUnusedVariable = false
