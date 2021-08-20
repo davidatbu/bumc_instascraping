@@ -1,121 +1,49 @@
-from google.colab import drive
-drive.mount('/content/drive')
-
 import numpy as np
 import pandas as pd
 import json
-import os
+from tqdm import tqdm
+from pandas.core.frame import DataFrame
+from glob import glob
+from tqdm import tqdm
+from transformers import BertModel
+import torch.nn as nn
+from torch.nn import BCELoss
+import numpy as np
+import random
+import torch
+from transformers import BertTokenizer, BertConfig
 
-% cd /content/drive/MyDrive
 
-df = pd.read_csv("Twitter_user_handles_to_predict.csv", encoding = "utf-8")
+df: DataFrame = pd.read_csv("Twitter_user_handles_to_predict.csv", encoding = "utf-8") # type: ignore
 df_labeled = pd.read_csv("Twitter_users_labeled_with_age_and_gender.csv", encoding = "latin-1")
 
 df_no_na = df[df['Username'].notna()]
-df_no_na
 
 age_no_na = df_labeled[df_labeled['human.labeled.age'].notna()]
-age_no_na
-
-# Get authentication for tweepy from auth.txt
-# auth.txt was uploaded before in order to use m3inference
-keys = ''
-with open(f'auth.txt', 'r') as reader:
-  keys=reader.read()
-keys = keys.split('\n')
-for i in range(len(keys)):
-  keys[i] = keys[i].split(':')[1];
-
-
-# Setup tweepy
-import tweepy
-api_key = keys[0]
-api_secret = keys[1]
-access_token = keys[2]
-access_secret = keys[3]
-auth = tweepy.OAuthHandler(api_key, api_secret)
-auth.set_access_token(access_token, access_secret)
-api = tweepy.API(auth, wait_on_rate_limit=True, wait_on_rate_limit_notify=True)
-
-
-import os
-import time
-from tqdm import tqdm
 
 
 user = age_no_na["screen_name"].values.tolist()
 age = age_no_na["human.labeled.age"].values.tolist()
 age = [1 if a>=21 else 0 for a in age]
 
-user_filter = []
-age_filter = []
-all_tweets = []
+user_filter: list[str] = []
+age_filter: list[int] = []
+all_tweets: list[list[str]] = []
 
-for i, userID in tqdm(enumerate(user)):
-  try:
-    tweets = api.user_timeline(screen_name=userID, count=100,include_rts = False, tweet_mode = 'extended')
-    tweet_text = [tweet._json['full_text'] for tweet in tweets]
-    all_tweets.append(tweet_text)
-    user_filter.append(user[i])
-    age_filter.append(age[i])
-      
-  except tweepy.TweepError as e:
-    # print(e.response.status_code, e.reason)
-    # the user not found error
-    # print("screen_name that failed=",  userID)
-    pass
 
-print("Extraction Done")
+user: list[str] = []
+age: list[int] = []
+tweets: list[list[str]] = []
+count_len: list[int] = []
+count_num: list[int] = []
 
-# save the tweets for each user
-print("the number of valid users", len(user_filter))
-! mkdir tweets
-for i, userID in tqdm(enumerate(user_filter)):
-  filename = "tweets/" + str(i) + '.txt'
-  
-  with open(filename, 'w', encoding='utf-8') as f:
-    f.write(userID + '\n')
-    f.write(str(age_filter[i]) + '\n')
-    for tw in all_tweets[i]:
-      f.write(tw.replace('\n', ' ') + '\n')
-
-from glob import glob
-from tqdm import tqdm
-import numpy as np
-
-user = []
-age = []
-tweets = []
-count_len = []
-count_num = []
-
-saved_pths = glob('tweets/*.txt')
-for filename in tqdm(saved_pths):
-  with open(filename, 'r') as f:
-    lines = f.readlines()
-    tweet = [line.strip() for line in lines[2:]]
-    if len(tweet) == 0:
-      continue
-    user.append(lines[0].strip())
-    age.append(int(lines[1].strip()))
-    count_num.append(len(tweet))
-    count_len.extend([len(t.split()) for t in tweet])
-    tweets.append(tweet)
-# print(np.mean(count_len), max(count_len), min(count_len))
-# print(np.mean(count_num), max(count_num), min(count_num))
 
 # age_no_na["screen_name"].values
 a1 = age_no_na["human.labeled.age"].values >= 21
 a2 = age_no_na["Lexicon.age.prediction"].values >= 21
 b1 = a1 == a2
-print("the accuary of the Lexicon.age.prediction")
 sum(b1)/len(b1)
 
-! pip  install transformers
-
-from transformers import BertModel
-import torch.nn as nn
-from torch.nn import BCELoss
 
 class Model(nn.Module):
     def __init__(self, config, model_name_or_path, num_labels=1):
@@ -172,10 +100,6 @@ class Model(nn.Module):
 
         return outputs 
 
-import random
-import torch
-from tqdm import tqdm
-from transformers import BertTokenizer, BertConfig
 
 
 ### hyper parameters
