@@ -22,10 +22,6 @@ df_no_na = df[df['Username'].notna()]
 age_no_na = df_labeled[df_labeled['human.labeled.age'].notna()]
 
 
-user = age_no_na["screen_name"].values.tolist()
-age = age_no_na["human.labeled.age"].values.tolist()
-age = [1 if a>=21 else 0 for a in age]
-
 user_filter: list[str] = []
 age_filter: list[int] = []
 all_tweets: list[list[str]] = []
@@ -303,7 +299,6 @@ print("Extraction Done")
 
 # save the tweets for each user
 print("the number of valid users to predicted", len(pre_user_filter))
-! mkdir pretweets
 for i, userID in tqdm(enumerate(pre_user_filter)):
   filename = "pretweets/" + str(i) + '.txt'
   
