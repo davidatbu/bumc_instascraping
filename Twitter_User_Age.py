@@ -1,10 +1,13 @@
+from dataclasses import dataclass
+from pathlib import Path
+from typing import  cast
 import numpy as np
+import sys
+from typer import Typer, Option
 import pandas as pd
 import json
 from tqdm import tqdm
-from pandas.core.frame import DataFrame
 from glob import glob
-from tqdm import tqdm
 from transformers import BertModel
 import torch.nn as nn
 from torch.nn import BCELoss
@@ -14,32 +17,6 @@ import torch
 from transformers import BertTokenizer, BertConfig
 
 
-df: DataFrame = pd.read_csv("Twitter_user_handles_to_predict.csv", encoding = "utf-8") # type: ignore
-df_labeled = pd.read_csv("Twitter_users_labeled_with_age_and_gender.csv", encoding = "latin-1")
-
-df_no_na = df[df['Username'].notna()]
-
-age_no_na = df_labeled[df_labeled['human.labeled.age'].notna()]
-
-
-user_filter: list[str] = []
-age_filter: list[int] = []
-all_tweets: list[list[str]] = []
-
-
-user: list[str] = []
-age: list[int] = []
-tweets: list[list[str]] = []
-count_len: list[int] = []
-count_num: list[int] = []
-
-
-# age_no_na["screen_name"].values
-a1 = age_no_na["human.labeled.age"].values >= 21
-a2 = age_no_na["Lexicon.age.prediction"].values >= 21
-b1 = a1 == a2
-sum(b1)/len(b1)
-
 
 class Model(nn.Module):
     def __init__(self, config, model_name_or_path, num_labels=1):
@@ -47,13 +24,12 @@ class Model(nn.Module):
 
         self.num_labels = num_labels
         self.bert = BertModel.from_pretrained(model_name_or_path)
-        self.dropout = nn.Dropout(0)
-        self.classifier = nn.Sequential(nn.Linear(config.hidden_size*4, config.hidden_size // 2), nn.GELU(), nn.Linear(config.hidden_size // 2, self.num_labels), nn.Sigmoid())
-        # self.freeze_params()
-
-    # def freeze_params(self):
-    #   for p in self.bert.parameters():
-    #     p.requires_grad=False
+        self.classifier = nn.Sequential(
+            nn.Linear(config.hidden_size * 4, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size // 2, self.num_labels),
+            nn.Sigmoid(),
+        )
 
     def forward(
         self,
@@ -68,7 +44,7 @@ class Model(nn.Module):
         labels=None,
     ):
 
-        output = self.bert(
+        output = self.bert.forward(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -79,11 +55,12 @@ class Model(nn.Module):
             return_dict=return_dict,
         )
 
-        x = torch.cat(output["hidden_states"][-4:], dim=-1)[:,0,:].mean(dim=0).unsqueeze(0) 
-        # x = output["last_hidden_state"].mean(dim=1).mean(dim=0).unsqueeze(0)
-        # x = output["pooler_output"].mean(dim=0).unsqueeze(0)    
-
-        x = self.dropout(x)
+        assert isinstance(output, dict)
+        x = (
+            torch.cat(output["hidden_states"][-4:], dim=-1)[:, 0, :]
+            .mean(dim=0)
+            .unsqueeze(0)
+        )
 
         logits = self.classifier(x)
 
@@ -94,8 +71,80 @@ class Model(nn.Module):
             loss = loss_fct(logits.view(-1), labels.view(-1))
             outputs = (loss,) + outputs
 
-        return outputs 
+        return outputs
 
+app = Typer()
+
+@dataclass
+class TrainingBatch:
+    username: str
+    tweets: list[str]
+    age: float
+
+def _read_training_data(input_dir: Path) -> list[TrainingBatch]:
+    labelled_usernames_fp = input_dir / "age_and_gender_labels.csv"
+    labelled_usernames = pd.read_csv(labelled_usernames_fp)
+    assert "user.name" in labelled_usernames.columns
+    assert "labeled age" in labelled_usernames.columns
+
+    labelled_usernames = labelled_usernames[
+        ["user.name", "labeled age"]
+    ]  # Discard other columns
+    total_count = len(labelled_usernames)
+    labelled_usernames = labelled_usernames[labelled_usernames["labeled age"].notna()]
+    non_null_count = len(labelled_usernames)
+    print(
+        f"Found {non_null_count} users with non-NA ages (from a total of {total_count}"
+    )
+
+    labelled_usernames["user.name"] = labelled_usernames["user.name"].str.lower()
+    tweet_fps = {
+        fp.stem.lower(): fp for fp in (input_dir / "tweets_per_user").iterdir()
+    }
+    assert all(uname.startswith("@") for uname in tweet_fps.keys())
+    assert labelled_usernames["user.name"].str.startswith("@").all()
+    tweets_found_filter = labelled_usernames["user.name"].isin(list(tweet_fps.keys()))
+    labelled_usernames = labelled_usernames[tweets_found_filter]
+    print(
+        f"Found {len(labelled_usernames)} usernames with labelled age, AND a file containing their tweets was present."
+    )
+
+    if (dups := labelled_usernames["user.name"].duplicated()).any():
+        labelled_usernames.drop_duplicates("user.name", inplace=True)
+        print(f"Dropped {dups.sum()} duplicated usernames.")
+
+    unames = set(labelled_usernames["user.name"].tolist())
+    tweet_fps = {
+        uname: fp
+        for uname, fp in tweet_fps.items()
+        if uname in unames
+    }
+    assert len(tweet_fps) == len(labelled_usernames)
+
+    labelled_usernames.set_index("user.name", inplace=True)
+
+    tweets_by_uname: list[tuple[str, list[str]]] = [
+        (uname, pd.read_csv(fp)["text"].tolist()) for uname, fp in tqdm(tweet_fps.items(), desc="Reading tweets")
+    ]
+    result = [
+        TrainingBatch(
+            username=username,
+        tweets=tweets,
+            age= cast(float, labelled_usernames.at[username, "labeled age"]),
+        )
+        for username, tweets in tweets_by_uname
+    ]
+    return result
+
+
+@app.command()
+def train(input_dir: Path = Option(...), model_output_dir: Path = Option(...)) -> None:
+    training_batches = _read_training_data(input_dir)
+
+if __name__ == '__main__':
+    train(Path('/Users/elemental/data/bumc/instascraping/labelled_data/'), Path('.'))
+    app()
+    sys.exit(0)
 
 
 ### hyper parameters
