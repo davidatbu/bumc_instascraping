@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import time
 from typing_extensions import ParamSpec
+from click.exceptions import BadOptionUsage, ClickException
 from dnips.web import ThreadedRateLimiter
 from random import choice, randint
 from dataclasses import dataclass
@@ -34,7 +35,6 @@ import requests
 from requests.sessions import Session
 import typer
 from typer import Argument
-from typer.params import Option
 
 app = typer.Typer()
 
@@ -313,9 +313,6 @@ class Error:
         return repr(self)
 
 
-_P = ParamSpec("_P")
-_Ret = TypeVar("_Ret")
-
 
 def reprcall(func: Callable, *args: Any, **kwargs: Any) -> str:
     repr_args = ", ".join(map(str, args))
@@ -323,12 +320,15 @@ def reprcall(func: Callable, *args: Any, **kwargs: Any) -> str:
     return f"{func.__name__}({repr_args}, {repr_kwargs})"
 
 
+_P = ParamSpec("_P")
+_Ret = TypeVar("_Ret")
+
 def exponential_backoff(
     is_failure: Callable[[_Ret], bool],
     multiplier: float = 1,
     exp: float = 2,
     verbose: bool = False,
-    zero_power_on_sucess: bool=False,
+    zero_power_on_sucess: bool = False,
 ) -> Callable[[Callable[_P, _Ret]], Callable[_P, _Ret]]:
     cur_power = 0
 
@@ -346,7 +346,7 @@ def exponential_backoff(
             if zero_power_on_sucess:
                 cur_power = 0
             else:
-                cur_power -= 1
+                cur_power = max(0, cur_power - 1)
             return val
 
         return new_func
@@ -454,35 +454,42 @@ def get_proxies() -> list[str]:
     return [f"socks4://{item['ip']}:{item['port']}" for item in proxies_json]
 
 
+def ratelimit_arg_validator(val: str) -> str:
+    try:
+        _, _ = map(int, val.split(','))
+    except Exception as e:
+        print(val)
+        print(e)
+        raise BadOptionUsage("ratelimit", "must be in the format 'period,calls'")
+    return val
+
 @app.command()
 def scrape_users(
     user_list_file: Path,
     output_dir: Path,
     posts_per_user: int,
     sess_file: Path,
-    backoff_mult: float = 30,
-    rlperiod: Optional[int] = Option(None, help="Rate limit period"),
-    rltimes: Optional[int] = Option(
-        None, help="Max number of requests within the rate limit period"
-    ),
+    backoff_mult: Optional[float] = None,
+    backoff_exp: Optional[float] = None,
+    ratelimit: List[str]= [],
     useproxies: bool = False,
 ) -> None:
-
-    if (rlperiod and not rltimes) or (rltimes and not rlperiod):
-        raise typer.BadParameter(
-            "Either both, or none, of --rlperiod and --rltimes must be used"
-        )
-    rate_limiter = None
-    if rlperiod:
-        assert rltimes
-        rate_limiter = ThreadedRateLimiter(
-            calls=rltimes,
-            period=rlperiod,
-            call_when_waiting=lambda secs: print(
+    rate_limiters = []
+    rate_limiter: Callable[[], Any]
+    try:
+        for a_ratelimit in ratelimit:
+            calls, period = list(map(int, a_ratelimit.split(',')))
+            rate_limiter = ThreadedRateLimiter(calls, period,
+call_when_waiting=lambda secs: print(
                 f"Rate limit hit. Waiting for {secs} seconds"
-            ),
-        )
+            )
+                    )
+            rate_limiters.append(rate_limiter)
+    except ValueError as e:
+        raise BadOptionUsage("ratelimit", f"ratelimit must be in calls,period format. {ratelimit}, {e}")
 
+    rate_limiter = lambda : [ one_limiter() for one_limiter in rate_limiters ] 
+        
     proxies = None
     if useproxies:
         proxies = get_proxies()
@@ -493,11 +500,21 @@ def scrape_users(
         if (uname := fp.name) in unames:
             unames.remove(uname)
 
-    backoff_wrapper = exponential_backoff(
-        is_failure=lambda res: isinstance(res, Error),
-        multiplier=backoff_mult,
-        verbose=True,
-    )
+    if backoff_mult is not None:
+        if backoff_exp is None:
+            raise ClickException(
+                "Either both, or none, of backoff-mult and backoff-exp"
+                "must be specified."
+            )
+
+        backoff_wrapper = exponential_backoff(
+            is_failure=lambda res: isinstance(res, Error),
+            multiplier=backoff_mult,
+            exp=backoff_exp,
+            verbose=True,
+        )
+    else:
+        backoff_wrapper = lambda x: x
     scrape_user_wrapped = backoff_wrapper(scrape_user)
     with saved_session(sess_file) as sess:
         if proxies:

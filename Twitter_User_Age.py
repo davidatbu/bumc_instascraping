@@ -1,20 +1,24 @@
+from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import  cast
-import numpy as np
+import random
+import random
 import sys
-from typer import Typer, Option
+from typing import Literal, Sequence, TypeVar, cast
+
+import numpy as np
+import numpy as np
 import pandas as pd
-import json
-from tqdm import tqdm
-from glob import glob
-from transformers import BertModel
+import torch
+import torch
 import torch.nn as nn
 from torch.nn import BCELoss
-import numpy as np
-import random
-import torch
-from transformers import BertTokenizer, BertConfig
+from tqdm import tqdm
+from tqdm import tqdm
+from transformers import BertModel
+from transformers import BertConfig, BertTokenizer
+from transformers import BertConfig, BertTokenizer
+from typer import Option, Typer
 
 
 
@@ -81,7 +85,13 @@ class TrainingBatch:
     tweets: list[str]
     age: float
 
-def _read_training_data(input_dir: Path) -> list[TrainingBatch]:
+@dataclass
+class PredictingBatch:
+    username: str
+    tweets: list[str]
+
+
+def _read_training_and_testing_data(input_dir: Path) -> list[TrainingBatch]:
     labelled_usernames_fp = input_dir / "age_and_gender_labels.csv"
     labelled_usernames = pd.read_csv(labelled_usernames_fp)
     assert "user.name" in labelled_usernames.columns
@@ -136,188 +146,243 @@ def _read_training_data(input_dir: Path) -> list[TrainingBatch]:
     ]
     return result
 
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+_T = TypeVar("_T")
+
+
+def _test_train_split(
+    items: Sequence[_T], test_split: float = 0.1, shuffle: bool=True
+) -> tuple[list[_T], list[_T]]:
+    test_num = round(len(items) * test_split)
+    if test_num == 0:
+        raise Exception(
+            f"Not enough values (a total of {len(items)}) to do a test split"
+            f" ratio of {test_split}."
+        )
+    if shuffle:
+        test_idxes = set(random.sample(range(len(items)), test_num))
+    else:
+        test_idxes = range(test_num)
+
+    test = []
+    train = []
+    for i, item in enumerate(items):
+        if i in test_idxes:
+            test.append(item)
+        else:
+            train.append(item)
+    return (train, test)
+
+
+DEFAULT_DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
+DEFAULT_FINETUNED_MODEL_NAME =  "finetuned_model.pth"
+DEFAULT_MODEL_NAME_OR_PATH = "bert-base-uncased"
 
 @app.command()
-def train(input_dir: Path = Option(...), model_output_dir: Path = Option(...)) -> None:
-    training_batches = _read_training_data(input_dir)
+def train(
+    input_dir: Path = Option(...),
+    model_output_dir: Path = Option(...),
+    ### hyper parameters
+    learn_rate: float = 5e-6,
+    epoch_num: int = 10,
+    max_seq_len: int = 18,
+    print_step: int = 100,
+    seed: int = 2021,
+    accumulation_steps: int = 10,
+    model_name_or_path: str = DEFAULT_MODEL_NAME_OR_PATH,
+    finetuned_model_name: str = DEFAULT_FINETUNED_MODEL_NAME,
+    device: Literal["cpu", "gpu"] = DEFAULT_DEVICE,
+) -> None:
+    training_and_testing_batches = _read_training_and_testing_data(input_dir)
+    training_batches, testing_batches = _test_train_split(
+        training_and_testing_batches, 0.1
+    )
+    _set_seed(seed)
+    # load model,  optimizer
+    config = BertConfig.from_pretrained(model_name_or_path)
+    tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
+    model = Model(config, model_name_or_path)
+    model.to(device)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=learn_rate
+    )
+    best_score = 0
+    current_step = 0
+    print_loss = []
+
+    for epoch in range(epoch_num):
+        print("========= Epoch", epoch + 1)
+        # train
+        epoch_loss = []
+        model.train()
+        for batch in training_batches:
+            encoded_input = tokenizer(
+                batch.tweets,
+                return_tensors="pt",
+                max_length=max_seq_len,
+                padding=True,
+                truncation=True,
+            )
+            input_ids = encoded_input["input_ids"].to(device)
+            token_type_ids = encoded_input["token_type_ids"].to(device)
+            attention_mask = encoded_input["attention_mask"].to(device)
+            label = torch.Tensor([batch.age]).to(device)
+
+            loss = model(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+                labels=label,
+            )[0]
+            print_loss.append(loss.item())
+            epoch_loss.append(loss.item())
+            current_step += 1
+
+            loss /= accumulation_steps
+            loss.backward()
+
+            if current_step % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+            if current_step % print_step == 0:
+                print(
+                    "mean train loss of 100 steps in the %d step: %.4f"
+                    % (current_step, sum(print_loss) / print_step)
+                )
+                print_loss.clear()
+        print(
+            "mean train loss in the %d epoch: %.4f"
+            % (epoch + 1, sum(epoch_loss) / len(epoch_loss))
+        )
+        print()
+
+        # test
+        model.eval()
+        predict = np.array([])
+        for batch in testing_batches:
+            encoded_input = tokenizer(
+                tw,
+                return_tensors="pt",
+                max_length=max_seq_len,
+                padding=True,
+                truncation=True,
+            )
+            input_ids = encoded_input["input_ids"].to(device)
+            token_type_ids = encoded_input["token_type_ids"].to(device)
+            attention_mask = encoded_input["attention_mask"].to(device)
+
+            output = model(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+            )[0]
+            output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
+            predict = np.append(predict, output.astype(int))
+
+        ground = np.array([batch.age for batch in testing_batches])
+        compr: np.ndarray = predict == ground
+        acc = compr.mean()
+        if acc > best_score:
+            best_score = acc
+            torch.save(model.state_dict(), model_output_dir / finetuned_model_name)
+        print(
+            "epoch %d   test acc : %.6f   best acc : %.6f"
+            % (epoch + 1, acc, best_score)
+        )
+
+
+
+@app.command()
+def predict(
+    input_dir: Path = Option(...),
+    model_dir: Path = Option(...),
+    max_seq_len: int = 18,
+    finetuned_model_name: str = DEFAULT_FINETUNED_MODEL_NAME,
+    model_name_or_path: str = DEFAULT_MODEL_NAME_OR_PATH,
+    device: Literal["cpu", "gpu"] = DEFAULT_DEVICE,
+) -> None:
+    config = BertConfig.from_pretrained(model_name_or_path)
+    tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
+    model = Model(config, model_name_or_path)
+    model.load_state_dict(torch.load(finetuned_model_path))
+    model.to(device)
+    # start predicting
+    model.eval()
+    predict = np.array([])
+
+    for i, tw in tqdm(
+        enumerate(tweets),
+        mininterval=2,
+        desc=" - Predicting " + str(len(age)) + "it",
+        leave=False,
+    ):
+        encoded_input = tokenizer(
+            tw,
+            return_tensors="pt",
+            max_length=max_seq_len,
+            padding=True,
+            truncation=True,
+        )
+        input_ids = encoded_input["input_ids"].to(device)
+        token_type_ids = encoded_input["token_type_ids"].to(device)
+        attention_mask = encoded_input["attention_mask"].to(device)
+
+        output = model(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+        )[0]
+        output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
+        predict = np.append(predict, output.astype(int))
+
+        ground = np.array(age)
+        compr = predict == ground
+        acc = np.sum(compr)/len(tweets)
+        print("total acc : %.4f" % acc)
+
+        bert_age_prediction=[]
+        num_tweets_used=[]
+
+        for name in df_labeled["screen_name"]:
+          if name not in user:
+            bert_age_prediction.append(None)
+            num_tweets_used.append(None)
+          else:
+            inx = user.index(name)
+            if predict[inx]==1:
+              ans = ">=21"
+            else:
+              ans = "<21"
+            bert_age_prediction.append(ans)
+            num_tweets_used.append(len(tweets[inx]))
+
+        df_labeled["bert.age.prediction"] = bert_age_prediction
+        df_labeled["num.tweets.used.bert.prediction"] = num_tweets_used
+         
+        df_labeled.to_csv('Twitter_users_labeled_prediction.csv', index=True, header=True)
+
+
 
 if __name__ == '__main__':
-    train(Path('/Users/elemental/data/bumc/instascraping/labelled_data/'), Path('.'))
     app()
-    sys.exit(0)
+    sys.exit(1)
 
 
-### hyper parameters
-learn_rate = 5e-6
-epoch_num = 10
-max_seq_len = 18
-print_step = 100
-seed = 2021
-accumulation_steps = 10
-
-model_name_or_path = "bert-base-uncased"
-finetune_model_path = 'finetune_model.pth'
-
-if torch.cuda.is_available():
-  device = torch.device("cuda")
-else:
-  device = torch.device("cpu")
-
-random.seed(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-
-# split train and test dataset
-num_sample = len(user)
-test_inx = random.sample(list(range(num_sample)),num_sample//10)
-train_tw = []
-test_tw = []
-train_age = []
-test_age = []
-for i in range(num_sample):
-  if i in test_inx:
-    test_tw.append(tweets[i])
-    test_age.append(age[i])
-  else:
-    train_tw.append(tweets[i])
-    train_age.append(age[i])
-print("the number of train:", len(train_age))
-print("the number of test:", len(test_age))
 
 
-# load model,  optimizer
-config = BertConfig.from_pretrained(model_name_or_path)
-tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
-model = Model(config, model_name_or_path)
-model.to(device)
-optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=learn_rate)
-
-# print the paramsters are expected to be updated
-# for n, p in model.named_parameters():
-#   if p.requires_grad:
-#     print(n)
-
-# start training 
-best_score = 0
-current_step = 0
-print_loss = []
-
-print()
-for epoch in range(epoch_num):
-  print("========= Epoch", epoch+1)
-  # train
-  epoch_loss = []
-  model.train()
-  for i, tw in enumerate(train_tw):
-    encoded_input = tokenizer(tw, return_tensors='pt', max_length=max_seq_len, padding=True, truncation=True)
-    input_ids = encoded_input['input_ids'].to(device)
-    token_type_ids = encoded_input['token_type_ids'].to(device)
-    attention_mask = encoded_input['attention_mask'].to(device)
-    label = torch.Tensor([train_age[i]]).to(device)
-
-    loss = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask, labels=label)[0] 
-    print_loss.append(loss.item())
-    epoch_loss.append(loss.item())
-    current_step += 1
-
-    loss /= accumulation_steps
-    loss.backward()
-
-    if current_step % accumulation_steps == 0:
-      optimizer.step()
-      optimizer.zero_grad()
-    
-    if current_step % print_step == 0:
-      print("mean train loss of 100 steps in the %d step: %.4f" % (current_step, sum(print_loss)/print_step))
-      print_loss.clear()
-  print("mean train loss in the %d epoch: %.4f" % (epoch+1, sum(epoch_loss)/len(epoch_loss)))
-  print()
-
-  # test
-  model.eval()
-  predict = np.array([])
-  for i, tw in enumerate(test_tw):
-    encoded_input = tokenizer(tw, return_tensors='pt', max_length=max_seq_len, padding=True, truncation=True)
-    input_ids = encoded_input['input_ids'].to(device)
-    token_type_ids = encoded_input['token_type_ids'].to(device)
-    attention_mask = encoded_input['attention_mask'].to(device)
-
-    output = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)[0]
-    output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
-    predict = np.append(predict, output.astype(int))
-  ground = np.array(test_age)
-  compr = predict == ground
-  acc = np.sum(compr)/len(test_tw)
-  if acc > best_score:
-    best_score = acc
-    torch.save(model.state_dict(), finetune_model_path)
-  print("epoch %d   test acc : %.6f   best acc : %.6f" % (epoch+1, acc, best_score))
-  print()
-  print()
 
 
-import random
-import torch
-from tqdm import tqdm
-from transformers import BertTokenizer, BertConfig
 
 
-# hyper parameters
-max_seq_len = 18
-model_name_or_path = "bert-base-uncased"
-finetune_model_path = 'finetune_model.pth'
-
-if torch.cuda.is_available():
-  device = torch.device("cuda")
-else:
-  device = torch.device("cpu")
 
 
-# load model,  optimizer
-config = BertConfig.from_pretrained(model_name_or_path)
-tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
-model = Model(config, model_name_or_path)
-model.load_state_dict(torch.load(finetune_model_path))
-model.to(device)
 
-# start predicting
-model.eval()
-predict = np.array([])
-for i, tw in tqdm(enumerate(tweets), mininterval=2, desc=' - Predicting ' + str(len(age)) + 'it', leave=False):
-  encoded_input = tokenizer(tw, return_tensors='pt', max_length=max_seq_len, padding=True, truncation=True)
-  input_ids = encoded_input['input_ids'].to(device)
-  token_type_ids = encoded_input['token_type_ids'].to(device)
-  attention_mask = encoded_input['attention_mask'].to(device)
-
-  output = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)[0]
-  output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
-  predict = np.append(predict, output.astype(int))
-ground = np.array(age)
-compr = predict == ground
-acc = np.sum(compr)/len(tweets)
-print("total acc : %.4f" % acc)
-
-bert_age_prediction=[]
-num_tweets_used=[]
-
-for name in df_labeled["screen_name"]:
-  if name not in user:
-    bert_age_prediction.append(None)
-    num_tweets_used.append(None)
-  else:
-    inx = user.index(name)
-    if predict[inx]==1:
-      ans = ">=21"
-    else:
-      ans = "<21"
-    bert_age_prediction.append(ans)
-    num_tweets_used.append(len(tweets[inx]))
-
-df_labeled["bert.age.prediction"] = bert_age_prediction
-df_labeled["num.tweets.used.bert.prediction"] = num_tweets_used
- 
-df_labeled.to_csv('Twitter_users_labeled_prediction.csv', index=True, header=True)
 
 
 df_labeled
@@ -396,7 +461,7 @@ pre_user = list(tw_json.keys())
 # hyper parameters
 max_seq_len = 18
 model_name_or_path = "bert-base-uncased"
-finetune_model_path = 'finetune_model.pth'
+finetuned_model_path = 'finetuned_model.pth'
 
 if torch.cuda.is_available():
   device = torch.device("cuda")
@@ -408,7 +473,7 @@ else:
 config = BertConfig.from_pretrained(model_name_or_path)
 tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
 model = Model(config, model_name_or_path)
-model.load_state_dict(torch.load(finetune_model_path))
+model.load_state_dict(torch.load(finetuned_model_path))
 model.to(device)
 
 # start predicting
