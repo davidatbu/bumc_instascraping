@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import time
 from typing_extensions import ParamSpec
 from click.exceptions import BadOptionUsage, ClickException
+from typer.params import Argument
 from .rate_limiter import ThreadedRateLimiter
 from random import choice, randint
 from dataclasses import dataclass
@@ -535,3 +536,4 @@ def scrape_users(
                     result_json = result.json(indent=2)
                     with open(output_dir / f"{uname}.json", "w") as f:
                         f.write(result_json)
+
