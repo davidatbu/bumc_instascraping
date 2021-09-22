@@ -466,7 +466,6 @@ def scrape_users(
     user_file: Path,
     output_dir: Path,
     posts_per_user: int,
-    sess_file: Path,
     backoff_mult: Optional[float] = None,
     backoff_exp: Optional[float] = None,
     ratelimit: List[str] = [],
@@ -520,20 +519,20 @@ def scrape_users(
 
     scrape_user_wrapped = backoff_wrapper(scrape_user)
 
-    with saved_session(sess_file) as sess:
-        if proxies:
-            sess = CacheControl(Session())
-            proxy = choice(proxies)
-            sess.proxies = {"https": proxy, "http": proxy}
+    sess = Session()
+    if proxies:
+        sess = CacheControl(sess)
+        proxy = choice(proxies)
+        sess.proxies = {"https": proxy, "http": proxy}
 
-        with typer.progressbar(unames) as pbar:
-            for uname in pbar:
-                pbar.label = f"Doing {uname}"
-                result = scrape_user_wrapped(uname, sess, posts_per_user, rate_limiter)
-                if isinstance(result, Error):
-                    print(result)
-                else:
-                    result_json = result.json(indent=2)
-                    with open(output_dir / f"{uname}.json", "w") as f:
-                        f.write(result_json)
+    with typer.progressbar(unames) as pbar:
+        for uname in pbar:
+            pbar.label = f"Doing {uname}"
+            result = scrape_user_wrapped(uname, sess, posts_per_user, rate_limiter)
+            if isinstance(result, Error):
+                print(result)
+            else:
+                result_json = result.json(indent=2)
+                with open(output_dir / f"{uname}.json", "w") as f:
+                    f.write(result_json)
 

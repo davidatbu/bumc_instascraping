@@ -1,9 +1,11 @@
 from __future__ import annotations
+import csv
+import typer
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import random
-from typing import List, Literal, Sequence, TypeVar, cast
+from typing import List, Literal, Sequence, TypeVar, NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,6 +19,10 @@ from transformers import BertConfig, BertTokenizer
 from .scraping import UserNode
 
 
+class ModelOutput(NamedTuple):
+    loss: Optional[torch.Tensor]
+    logits: torch.Tensor
+
 class Model(nn.Module):
     def __init__(self, config, model_name_or_path, num_labels=1):
         super().__init__()
@@ -29,6 +35,7 @@ class Model(nn.Module):
             nn.Linear(config.hidden_size // 2, self.num_labels),
             nn.Sigmoid(),
         )
+        self.loss_fct = BCELoss()
 
     def forward(
         self,
@@ -41,7 +48,7 @@ class Model(nn.Module):
         output_hidden_states=True,
         return_dict=True,
         labels=None,
-    ):
+    )-> ModelOutput:
 
         output = self.bert.forward(
             input_ids,
@@ -62,15 +69,11 @@ class Model(nn.Module):
         )
 
         logits = self.classifier(x)
-
-        outputs = (logits,)
-
+        loss = None
         if labels is not None:
-            loss_fct = BCELoss()
-            loss = loss_fct(logits.view(-1), labels.view(-1))
-            outputs = (loss,) + outputs
+            loss = self.loss_fct(logits.view(-1), labels.view(-1))
 
-        return outputs
+        return ModelOutput(loss=loss, logits=logits)
 
 
 
@@ -79,7 +82,7 @@ class Model(nn.Module):
 class TrainingBatch:
     username: str
     tweets: list[str]
-    age: float
+    age_greater_than_cutoff: float
 
 
 @dataclass
@@ -88,9 +91,9 @@ class PredictingBatch:
     tweets: list[str]
 
 
-def _read_training_and_testing_data(input_dir: Path) -> list[TrainingBatch]:
+def _read_training_and_testing_data(input_dir: Path, age_cutoff: int) -> list[TrainingBatch]:
     labelled_usernames_fp = input_dir / "age_and_gender_labels.csv"
-    labelled_usernames = pd.read_csv(labelled_usernames_fp)
+    labelled_usernames: pd.DataFrame = pd.read_csv(labelled_usernames_fp)
     assert "user.name" in labelled_usernames.columns
     assert "labeled age" in labelled_usernames.columns
 
@@ -134,12 +137,11 @@ def _read_training_and_testing_data(input_dir: Path) -> list[TrainingBatch]:
         TrainingBatch(
             username=username,
             tweets=tweets,
-            age=cast(float, labelled_usernames.at[username, "labeled age"]),
+            age_greater_than_cutoff=1.0 if labelled_usernames.at[username, "labeled age"] >= age_cutoff else 0.0,
         )
         for username, tweets in tweets_by_uname
     ]
-    return result[:10]
-    # return result
+    return result
 
 
 def _set_seed(seed: int) -> None:
@@ -178,9 +180,9 @@ def _test_train_split(
 
 class Device(Enum):
     cpu = "cpu"
-    gpu = "gpu"
+    cuda = "cuda"
 
-DEFAULT_DEVICE = Device.gpu if torch.cuda.is_available() else Device.cpu
+DEFAULT_DEVICE = Device.cuda if torch.cuda.is_available() else Device.cpu
 DEFAULT_FINETUNED_MODEL_NAME = "finetuned_model.pth"
 DEFAULT_MODEL_NAME_OR_PATH = "bert-base-uncased"
 
@@ -197,9 +199,10 @@ def train(
     accumulation_steps: int,
     model_name_or_path: str,
     finetuned_model_name: str,
-    device: Literal["cpu", "gpu"],
+    device: Literal["cpu", "cuda"],
+    age_cutoff: int,
 ) -> None:
-    training_and_testing_batches = _read_training_and_testing_data(input_dir)
+    training_and_testing_batches = _read_training_and_testing_data(input_dir, age_cutoff)
     training_batches, testing_batches = _test_train_split(
         training_and_testing_batches, 0.1
     )
@@ -221,42 +224,45 @@ def train(
         # train
         epoch_loss = []
         model.train()
-        for batch in training_batches:
-            encoded_input = tokenizer(
-                batch.tweets,
-                return_tensors="pt",
-                max_length=max_seq_len,
-                padding=True,
-                truncation=True,
-            )
-            input_ids = encoded_input["input_ids"].to(device)
-            token_type_ids = encoded_input["token_type_ids"].to(device)
-            attention_mask = encoded_input["attention_mask"].to(device)
-            label = torch.Tensor([batch.age]).to(device)
-
-            loss = model(
-                input_ids=input_ids,
-                token_type_ids=token_type_ids,
-                attention_mask=attention_mask,
-                labels=label,
-            )[0]
-            print_loss.append(loss.item())
-            epoch_loss.append(loss.item())
-            current_step += 1
-
-            loss /= accumulation_steps
-            loss.backward()
-
-            if current_step % accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-
-            if current_step % print_step == 0:
-                print(
-                    "mean train loss of 100 steps in the %d step: %.4f"
-                    % (current_step, sum(print_loss) / print_step)
+        pbar = typer.progressbar(training_batches)
+        with pbar as pbar:
+            for batch in pbar:
+                encoded_input = tokenizer(
+                    batch.tweets,
+                    return_tensors="pt",
+                    max_length=max_seq_len,
+                    padding=True,
+                    truncation=True,
                 )
-                print_loss.clear()
+                input_ids = encoded_input["input_ids"].to(device)
+                token_type_ids = encoded_input["token_type_ids"].to(device)
+                attention_mask = encoded_input["attention_mask"].to(device)
+                label = torch.Tensor([batch.age_greater_than_cutoff]).to(device)
+
+                loss = model.forward(
+                    input_ids=input_ids,
+                    token_type_ids=token_type_ids,
+                    attention_mask=attention_mask,
+                    labels=label,
+                ).loss
+                assert loss is not None
+                print_loss.append(loss.item())
+                epoch_loss.append(loss.item())
+                current_step += 1
+
+                loss /= accumulation_steps
+                loss.backward()
+
+                if current_step % accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                if current_step % print_step == 0:
+                    print(
+                        "mean train loss of 100 steps in the %d step: %.4f"
+                        % (current_step, sum(print_loss) / print_step)
+                    )
+                    print_loss.clear()
         print(
             "mean train loss in the %d epoch: %.4f"
             % (epoch + 1, sum(epoch_loss) / len(epoch_loss))
@@ -277,37 +283,38 @@ def train(
             token_type_ids = encoded_input["token_type_ids"].to(device)
             attention_mask = encoded_input["attention_mask"].to(device)
 
-            output = model(
+            output = model.forward(
                 input_ids=input_ids,
                 token_type_ids=token_type_ids,
                 attention_mask=attention_mask,
-            )[0]
+            ).logits
             output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
             if predictions is not None:
                 predictions = np.append(predictions, output.astype(int))
             else:
                 predictions = output.astype(int)
 
-        ground = np.array([batch.age for batch in testing_batches])
+        ground = np.array([batch.age_greater_than_cutoff for batch in testing_batches])
         compr: np.ndarray = predictions == ground
         acc = compr.mean()
-
-        if acc > best_score:
-            best_score = acc
-            torch.save(model.state_dict(), model_output_dir / finetuned_model_name)
         print(
             "epoch %d   test acc : %.6f   best acc : %.6f"
             % (epoch + 1, acc, best_score)
         )
+        if acc > best_score:
+            best_score = acc
+            torch.save(model.state_dict(), model_output_dir / finetuned_model_name)
+
 
 
 def predict(
     input_dir: Path,
-    model_dir: Path,
-    max_seq_len: int = 18,
-    finetuned_model_name: str = DEFAULT_FINETUNED_MODEL_NAME,
-    model_name_or_path: str = DEFAULT_MODEL_NAME_OR_PATH,
-    device: Literal["cpu", "gpu"] = DEFAULT_DEVICE,
+    prediction_output_file: Path,
+    max_seq_len: int,
+    finetuned_model_path: Path,
+    model_name_or_path: str,
+    age_cutoff: int,
+    device: Literal["cpu", "cuda"],
 ) -> None:
     config = BertConfig.from_pretrained(model_name_or_path)
     tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
@@ -315,9 +322,10 @@ def predict(
     model.load_state_dict(torch.load(finetuned_model_path))
     model.to(device)
     model.eval()
-    predict = np.array([])
+    predictions = []
+    predicted_for_users = []
 
-    json_fps = list(input_dir.glob("%.json"))
+    json_fps = list(input_dir.glob("*.json"))
 
     for json_fp in tqdm(
         json_fps,
@@ -326,21 +334,22 @@ def predict(
         with json_fp.open() as json_file:
             user_node = UserNode.parse_raw(json_file.read())
 
-        tweets: List[str] = []
+        posts: List[str] = []
         for edge in user_node.edge_owner_to_timeline_media.edges:
             has_caption = len(edge.node.edge_media_to_caption.edges) > 0
             if has_caption:
                 caption = edge.node.edge_media_to_caption.edges[0].node.text
-                tweets.append(caption)
+                posts.append(caption)
 
-        print(f" Found {len(tweets)} tweets for {json_fp.stem} ... ", end="")
-        if not tweets:
-            print("Skipping since 0 tweets found in JSON file.")
+        print(f" Found {len(posts)} posts for {json_fp.stem} ... ", end="")
+        if not posts:
+            print("Skipping since 0 posts found in JSON file.")
+            continue
         else:
             print("")
 
         encoded_input = tokenizer(
-            tweets,
+            posts,
             return_tensors="pt",
             max_length=max_seq_len,
             padding=True,
@@ -354,35 +363,12 @@ def predict(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
             attention_mask=attention_mask,
-        )[0]
+        ).logits
         output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
-        predict = np.append(predict, output.astype(int))
+        predictions.extend(output.astype(int))
+        predicted_for_users.append(json_fp.stem)
 
-        ground = np.array(age)
-        compr = predict == ground
-        acc = np.sum(compr) / len(tweets)
-        print("total acc : %.4f" % acc)
-
-        bert_age_prediction = []
-        num_tweets_used = []
-
-        for name in df_labeled["screen_name"]:
-            if name not in user:
-                bert_age_prediction.append(None)
-                num_tweets_used.append(None)
-            else:
-                inx = user.index(name)
-                if predict[inx] == 1:
-                    ans = ">=21"
-                else:
-                    ans = "<21"
-                bert_age_prediction.append(ans)
-                num_tweets_used.append(len(tweets[inx]))
-
-        df_labeled["bert.age.prediction"] = bert_age_prediction
-        df_labeled["num.tweets.used.bert.prediction"] = num_tweets_used
-
-        df_labeled.to_csv(
-            "Twitter_users_labeled_prediction.csv", index=True, header=True
-        )
-
+    with prediction_output_file.open("w") as fout:
+        csv_writer = csv.writer(fout)
+        csv_writer.writerow(["Username", f"Age is equal to or greater than {age_cutoff}"])
+        csv_writer.writerows(zip(predicted_for_users, predictions))
