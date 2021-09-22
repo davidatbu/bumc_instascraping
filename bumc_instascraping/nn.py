@@ -1,25 +1,23 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from glob import glob
+import json
 from pathlib import Path
 import random
-import random
 import sys
-from typing import Literal, Sequence, TypeVar, cast
+from typing import List, Literal, Sequence, TypeVar, cast
 
 import numpy as np
-import numpy as np
 import pandas as pd
-import torch
 import torch
 import torch.nn as nn
 from torch.nn import BCELoss
 from tqdm import tqdm
-from tqdm import tqdm
 from transformers import BertModel
-from transformers import BertConfig, BertTokenizer
 from transformers import BertConfig, BertTokenizer
 from typer import Option, Typer
 
+from .scraping import UserNode
 
 
 class Model(nn.Module):
@@ -77,13 +75,16 @@ class Model(nn.Module):
 
         return outputs
 
+
 app = Typer()
+
 
 @dataclass
 class TrainingBatch:
     username: str
     tweets: list[str]
     age: float
+
 
 @dataclass
 class PredictingBatch:
@@ -124,27 +125,25 @@ def _read_training_and_testing_data(input_dir: Path) -> list[TrainingBatch]:
         print(f"Dropped {dups.sum()} duplicated usernames.")
 
     unames = set(labelled_usernames["user.name"].tolist())
-    tweet_fps = {
-        uname: fp
-        for uname, fp in tweet_fps.items()
-        if uname in unames
-    }
+    tweet_fps = {uname: fp for uname, fp in tweet_fps.items() if uname in unames}
     assert len(tweet_fps) == len(labelled_usernames)
 
     labelled_usernames.set_index("user.name", inplace=True)
 
     tweets_by_uname: list[tuple[str, list[str]]] = [
-        (uname, pd.read_csv(fp)["text"].tolist()) for uname, fp in tqdm(tweet_fps.items(), desc="Reading tweets")
+        (uname, pd.read_csv(fp)["text"].tolist())
+        for uname, fp in tqdm(tweet_fps.items(), desc="Reading tweets")
     ]
     result = [
         TrainingBatch(
             username=username,
-        tweets=tweets,
-            age= cast(float, labelled_usernames.at[username, "labeled age"]),
+            tweets=tweets,
+            age=cast(float, labelled_usernames.at[username, "labeled age"]),
         )
         for username, tweets in tweets_by_uname
     ]
     return result
+
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -152,11 +151,12 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
+
 _T = TypeVar("_T")
 
 
 def _test_train_split(
-    items: Sequence[_T], test_split: float = 0.1, shuffle: bool=True
+    items: Sequence[_T], test_split: float = 0.1, shuffle: bool = True
 ) -> tuple[list[_T], list[_T]]:
     test_num = round(len(items) * test_split)
     if test_num == 0:
@@ -180,8 +180,9 @@ def _test_train_split(
 
 
 DEFAULT_DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
-DEFAULT_FINETUNED_MODEL_NAME =  "finetuned_model.pth"
+DEFAULT_FINETUNED_MODEL_NAME = "finetuned_model.pth"
 DEFAULT_MODEL_NAME_OR_PATH = "bert-base-uncased"
+
 
 @app.command()
 def train(
@@ -297,7 +298,6 @@ def train(
         )
 
 
-
 @app.command()
 def predict(
     input_dir: Path = Option(...),
@@ -312,18 +312,33 @@ def predict(
     model = Model(config, model_name_or_path)
     model.load_state_dict(torch.load(finetuned_model_path))
     model.to(device)
-    # start predicting
     model.eval()
     predict = np.array([])
 
-    for i, tw in tqdm(
-        enumerate(tweets),
-        mininterval=2,
-        desc=" - Predicting " + str(len(age)) + "it",
+    json_fps = list(input_dir.glob("%.json"))
+
+    for json_fp in tqdm(
+        json_fps,
         leave=False,
     ):
+        with json_fp.open() as json_file:
+            user_node = UserNode.parse_raw(json_file.read())
+
+        tweets: List[str] = []
+        for edge in user_node.edge_owner_to_timeline_media.edges:
+            has_caption = len(edge.node.edge_media_to_caption.edges) > 0
+            if has_caption:
+                caption = edge.node.edge_media_to_caption.edges[0].node.text
+                tweets.append(caption)
+
+        print(f" Found {len(tweets)} tweets for {json_fp.stem} ... ", end="")
+        if not tweets:
+            print("Skipping since 0 tweets found in JSON file.")
+        else:
+            print("")
+
         encoded_input = tokenizer(
-            tw,
+            tweets,
             return_tensors="pt",
             max_length=max_seq_len,
             padding=True,
@@ -343,53 +358,40 @@ def predict(
 
         ground = np.array(age)
         compr = predict == ground
-        acc = np.sum(compr)/len(tweets)
+        acc = np.sum(compr) / len(tweets)
         print("total acc : %.4f" % acc)
 
-        bert_age_prediction=[]
-        num_tweets_used=[]
+        bert_age_prediction = []
+        num_tweets_used = []
 
         for name in df_labeled["screen_name"]:
-          if name not in user:
-            bert_age_prediction.append(None)
-            num_tweets_used.append(None)
-          else:
-            inx = user.index(name)
-            if predict[inx]==1:
-              ans = ">=21"
+            if name not in user:
+                bert_age_prediction.append(None)
+                num_tweets_used.append(None)
             else:
-              ans = "<21"
-            bert_age_prediction.append(ans)
-            num_tweets_used.append(len(tweets[inx]))
+                inx = user.index(name)
+                if predict[inx] == 1:
+                    ans = ">=21"
+                else:
+                    ans = "<21"
+                bert_age_prediction.append(ans)
+                num_tweets_used.append(len(tweets[inx]))
 
         df_labeled["bert.age.prediction"] = bert_age_prediction
         df_labeled["num.tweets.used.bert.prediction"] = num_tweets_used
-         
-        df_labeled.to_csv('Twitter_users_labeled_prediction.csv', index=True, header=True)
+
+        df_labeled.to_csv(
+            "Twitter_users_labeled_prediction.csv", index=True, header=True
+        )
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app()
     sys.exit(1)
 
 
-
-
-
-
-
-
-
-
-
-
-
 df_labeled
 
-import os
-import time
-from tqdm import tqdm
 
 pre_user = df_no_na["Username"].values.tolist()
 
@@ -397,76 +399,67 @@ pre_user_filter = []
 pre_all_tweets = []
 
 for i, userID in tqdm(enumerate(pre_user)):
-  try:
-    tweets = api.user_timeline(screen_name=userID, count=100,include_rts = False, tweet_mode = 'extended')
-    tweet_text = [tweet._json['full_text'] for tweet in tweets]
-    pre_all_tweets.append(tweet_text)
-    pre_user_filter.append(pre_user[i])
-      
-  except tweepy.TweepError as e:
-    # print(e.response.status_code, e.reason)
-    # the user not found error
-    # print("screen_name that failed=",  userID)
-    pass
+    try:
+        tweets = api.user_timeline(
+            screen_name=userID, count=100, include_rts=False, tweet_mode="extended"
+        )
+        tweet_text = [tweet._json["full_text"] for tweet in tweets]
+        pre_all_tweets.append(tweet_text)
+        pre_user_filter.append(pre_user[i])
+
+    except tweepy.TweepError as e:
+        # print(e.response.status_code, e.reason)
+        # the user not found error
+        # print("screen_name that failed=",  userID)
+        pass
 
 print("Extraction Done")
 
 # save the tweets for each user
 print("the number of valid users to predicted", len(pre_user_filter))
 for i, userID in tqdm(enumerate(pre_user_filter)):
-  filename = "pretweets/" + str(i) + '.txt'
-  
-  with open(filename, 'w', encoding='utf-8') as f:
-    f.write(userID + '\n')
-    for tw in pre_all_tweets[i]:
-      f.write(tw.replace('\n', ' ') + '\n')
+    filename = "pretweets/" + str(i) + ".txt"
 
-from glob import glob
-from tqdm import tqdm
-import numpy as np
-import json
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(userID + "\n")
+        for tw in pre_all_tweets[i]:
+            f.write(tw.replace("\n", " ") + "\n")
+
 
 tw_json = {}
 pre_user = []
 pre_tweets = []
 
-saved_pths = glob('pretweets/*.txt')
+saved_pths = glob("pretweets/*.txt")
 # print(len(saved_pths))
 
 for filename in tqdm(saved_pths):
-  with open(filename, 'r') as f:
-    lines = f.readlines()
-    tweet = [line.strip() for line in lines[1:]]
-    if len(tweet) == 0:
-      continue
-    pre_user.append(lines[0].strip())
-    pre_tweets.append(tweet)
-    tw_json[lines[0].strip()] = tweet
+    with open(filename, "r") as f:
+        lines = f.readlines()
+        tweet = [line.strip() for line in lines[1:]]
+        if len(tweet) == 0:
+            continue
+        pre_user.append(lines[0].strip())
+        pre_tweets.append(tweet)
+        tw_json[lines[0].strip()] = tweet
 
-with open("pretweets.json", "w", encoding ="utf8") as f:
-  json.dump(tw_json, f, ensure_ascii=False)
+with open("pretweets.json", "w", encoding="utf8") as f:
+    json.dump(tw_json, f, ensure_ascii=False)
 
-
-import numpy as np
-import json
-import random
-import torch
-from tqdm import tqdm
-from transformers import BertTokenizer, BertConfig
 
 # load data
-tw_json = json.load(open("pretweets.json", "r", encoding ="utf8"))
+tw_json = json.load(open("pretweets.json", "r", encoding="utf8"))
 pre_user = list(tw_json.keys())
 
 # hyper parameters
 max_seq_len = 18
 model_name_or_path = "bert-base-uncased"
-finetuned_model_path = 'finetuned_model.pth'
+finetuned_model_path = "finetuned_model.pth"
 
 if torch.cuda.is_available():
-  device = torch.device("cuda")
+    device = torch.device("cuda")
 else:
-  device = torch.device("cpu")
+    device = torch.device("cpu")
 
 
 # load model
@@ -479,37 +472,48 @@ model.to(device)
 # start predicting
 model.eval()
 predict = np.array([])
-for i, u in tqdm(enumerate(pre_user), mininterval=2, desc=' - Predicting ' + str(len(pre_user)) + 'it', leave=False):
-  tw = tw_json[u]
-  encoded_input = tokenizer(tw, return_tensors='pt', max_length=max_seq_len, padding=True, truncation=True)
-  input_ids = encoded_input['input_ids'].to(device)
-  token_type_ids = encoded_input['token_type_ids'].to(device)
-  attention_mask = encoded_input['attention_mask'].to(device)
+for i, u in tqdm(
+    enumerate(pre_user),
+    mininterval=2,
+    desc=" - Predicting " + str(len(pre_user)) + "it",
+    leave=False,
+):
+    tw = tw_json[u]
+    encoded_input = tokenizer(
+        tw, return_tensors="pt", max_length=max_seq_len, padding=True, truncation=True
+    )
+    input_ids = encoded_input["input_ids"].to(device)
+    token_type_ids = encoded_input["token_type_ids"].to(device)
+    attention_mask = encoded_input["attention_mask"].to(device)
 
-  output = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)[0]
-  output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
-  predict = np.append(predict, output.astype(int))
+    output = model(
+        input_ids=input_ids,
+        token_type_ids=token_type_ids,
+        attention_mask=attention_mask,
+    )[0]
+    output = torch.squeeze(output, -1).cpu().data.numpy() >= 0.5
+    predict = np.append(predict, output.astype(int))
 
-bert_age_prediction=[]
-num_tweets_used=[]
+bert_age_prediction = []
+num_tweets_used = []
 
 for name in df["Username"]:
-  if name not in pre_user:
-    bert_age_prediction.append(None)
-    num_tweets_used.append(None)
-  else:
-    inx = pre_user.index(name)
-    if predict[inx]==1:
-      ans = ">=21"
+    if name not in pre_user:
+        bert_age_prediction.append(None)
+        num_tweets_used.append(None)
     else:
-      ans = "<21"
-    bert_age_prediction.append(ans)
-    num_tweets_used.append(len(tw_json[name]))
+        inx = pre_user.index(name)
+        if predict[inx] == 1:
+            ans = ">=21"
+        else:
+            ans = "<21"
+        bert_age_prediction.append(ans)
+        num_tweets_used.append(len(tw_json[name]))
 
 df["bert.age.prediction"] = bert_age_prediction
 df["num.tweets.used.bert.prediction"] = num_tweets_used
- 
-df.to_csv('Twitter_user_handles_to_prediction.csv', index=True, header=True)
+
+df.to_csv("Twitter_user_handles_to_prediction.csv", index=True, header=True)
 
 
 df

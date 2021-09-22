@@ -316,6 +316,10 @@ _P = ParamSpec("_P")
 _Ret = TypeVar("_Ret")
 
 
+def no_backoff(
+        ) -> Callable[[Callable[_P, _Ret]], Callable[_P, _Ret]]:
+    return lambda x: x
+
 def exponential_backoff(
     is_failure: Callable[[_Ret], bool],
     multiplier: float = 1,
@@ -511,7 +515,7 @@ def scrape_users(
             verbose=True,
         )
     else:
-        backoff_wrapper = lambda x: x
+        backoff_wrapper = no_backoff()
 
     scrape_user_wrapped = backoff_wrapper(scrape_user)
 
