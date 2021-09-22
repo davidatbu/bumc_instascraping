@@ -2,7 +2,7 @@ from contextlib import contextmanager
 import time
 from typing_extensions import ParamSpec
 from click.exceptions import BadOptionUsage, ClickException
-from dnips.web import ThreadedRateLimiter
+from .rate_limiter import ThreadedRateLimiter
 from random import choice, randint
 from dataclasses import dataclass
 import json
@@ -24,6 +24,7 @@ from typing import (
     Union,
 )
 from urllib.parse import SplitResult, urlencode, urljoin, urlsplit, urlunsplit
+import typer
 
 from bs4 import BeautifulSoup as Soup
 from cachecontrol import CacheControl
@@ -33,10 +34,6 @@ from pydantic.generics import GenericModel as Gm
 from requests import ConnectionError
 import requests
 from requests.sessions import Session
-import typer
-from typer import Argument
-
-app = typer.Typer()
 
 
 ElAttrs = Dict[str, Any]
@@ -135,15 +132,11 @@ def _extract_script_els(
     return to_write
 
 
-@app.command()
 def extract_js(
-    root_fp: Path = Argument(
-        Path("./barackobama.html"),
-        help="Downloaded file from `www.instagram.com/{USERNAME}",
-    ),
-    out_fp: str = Argument("{basename}_scripts.js"),
-    base_url: str = Argument("https://www.instagram.com"),
-    tolerate_no_internet: bool = False,
+    root_fp: Path,
+    out_fp: str,
+    base_url: str,
+    tolerate_no_internet: bool,
 ) -> None:
     root_fp = Path("./barackobama.html")
     with root_fp.open() as f:
@@ -205,7 +198,7 @@ def laborous_way_of_finding_user_id(uname: str, sess: Session) -> Optional[str]:
             return None
         user_id = match.groups(1)[0]
         if not isinstance(user_id, str):
-            print("Weird. match().groups(1) is giving out an int.")
+            print(" Weird. match().groups(1) is giving out an int.")
             return None
         return user_id
     except Exception as e:
@@ -245,7 +238,7 @@ def extract_api_param(
 ) -> Optional[_T]:
     match = ptrn.search(js_txt)
     if match is None:
-        print(f"Couldn't extract {ptrn}")
+        print(f" Couldn't extract {ptrn}")
         return
     return converter(match.group(1))
 
@@ -313,7 +306,6 @@ class Error:
         return repr(self)
 
 
-
 def reprcall(func: Callable, *args: Any, **kwargs: Any) -> str:
     repr_args = ", ".join(map(str, args))
     repr_kwargs = ", ".join(f"{key}={value}" for key, value in kwargs.items())
@@ -322,6 +314,7 @@ def reprcall(func: Callable, *args: Any, **kwargs: Any) -> str:
 
 _P = ParamSpec("_P")
 _Ret = TypeVar("_Ret")
+
 
 def exponential_backoff(
     is_failure: Callable[[_Ret], bool],
@@ -359,7 +352,7 @@ def get_user_feed(
     api_params: ApiParams,
     num_to_fetch: int,
     after_token: Optional[str] = None,
-    rate_limiter: Optional[ThreadedRateLimiter] = None,
+    rate_limiter: Optional[Callable[[], Any]] = None,
 ) -> Union[Error, UserNode]:
     # print(f"Fetching hopeuflly {num_to_fetch} items for {api_params.user_id} ")
     ask_now = min(45 + randint(-5, 5), num_to_fetch)
@@ -430,7 +423,7 @@ def scrape_user(
     uname: str,
     sess: Session,
     max: int,
-    rate_limiter: Optional[ThreadedRateLimiter] = None,
+    rate_limiter: Optional[Callable[[], Any]] = None,
 ) -> Union[Error, UserNode]:
     api_params = extract_api_params(uname, sess)
     if api_params is None:
@@ -456,45 +449,49 @@ def get_proxies() -> list[str]:
 
 def ratelimit_arg_validator(val: str) -> str:
     try:
-        _, _ = map(int, val.split(','))
+        _, _ = map(int, val.split(","))
     except Exception as e:
         print(val)
         print(e)
         raise BadOptionUsage("ratelimit", "must be in the format 'period,calls'")
     return val
 
-@app.command()
+
 def scrape_users(
-    user_list_file: Path,
+    user_file: Path,
     output_dir: Path,
     posts_per_user: int,
     sess_file: Path,
     backoff_mult: Optional[float] = None,
     backoff_exp: Optional[float] = None,
-    ratelimit: List[str]= [],
+    ratelimit: List[str] = [],
     useproxies: bool = False,
 ) -> None:
     rate_limiters = []
     rate_limiter: Callable[[], Any]
     try:
         for a_ratelimit in ratelimit:
-            calls, period = list(map(int, a_ratelimit.split(',')))
-            rate_limiter = ThreadedRateLimiter(calls, period,
-call_when_waiting=lambda secs: print(
-                f"Rate limit hit. Waiting for {secs} seconds"
+            calls, period = list(map(int, a_ratelimit.split(",")))
+            rate_limiter = ThreadedRateLimiter(
+                calls,
+                period,
+                call_when_waiting=lambda secs: print(
+                    f" Rate limit hit. Waiting for {secs} seconds"
+                ),
             )
-                    )
             rate_limiters.append(rate_limiter)
     except ValueError as e:
-        raise BadOptionUsage("ratelimit", f"ratelimit must be in calls,period format. {ratelimit}, {e}")
+        raise BadOptionUsage(
+            "ratelimit", f"ratelimit must be in calls,period format. {ratelimit}, {e}"
+        )
 
-    rate_limiter = lambda : [ one_limiter() for one_limiter in rate_limiters ] 
-        
+    rate_limiter = lambda: [one_limiter() for one_limiter in rate_limiters]
+
     proxies = None
     if useproxies:
         proxies = get_proxies()
 
-    with user_list_file.open() as f:
+    with user_file.open() as f:
         unames = set(l.strip().lower() for l in f)
     for fp in output_dir.glob("*.json"):
         if (uname := fp.name) in unames:
@@ -515,12 +512,15 @@ call_when_waiting=lambda secs: print(
         )
     else:
         backoff_wrapper = lambda x: x
+
     scrape_user_wrapped = backoff_wrapper(scrape_user)
+
     with saved_session(sess_file) as sess:
         if proxies:
             sess = CacheControl(Session())
             proxy = choice(proxies)
             sess.proxies = {"https": proxy, "http": proxy}
+
         with typer.progressbar(unames) as pbar:
             for uname in pbar:
                 pbar.label = f"Doing {uname}"
@@ -531,7 +531,3 @@ call_when_waiting=lambda secs: print(
                     result_json = result.json(indent=2)
                     with open(output_dir / f"{uname}.json", "w") as f:
                         f.write(result_json)
-
-
-if __name__ == "__main__":
-    app()
